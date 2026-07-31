@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -25,7 +26,20 @@ import (
 
 const authTimeout = 15 * time.Second
 
+// fileConfig mirrors the command-line flags so the client can be configured
+// from a JSON file (e.g. by the Homebrew launchd service). Explicit flags
+// take precedence over file values, which take precedence over env vars.
+type fileConfig struct {
+	Server     string `json:"server"`
+	Token      string `json:"token"`
+	KimiBin    string `json:"kimi_bin"`
+	KimiPort   int    `json:"kimi_port"`
+	PublicHost string `json:"public_host"`
+	Attach     string `json:"attach"`
+}
+
 func main() {
+	configPath := flag.String("config", "", "path to a JSON config file (flags override file values)")
 	server := flag.String("server", "", "public server tunnel address, host:port (required)")
 	token := flag.String("token", "", "pre-shared token (or KIMI_PROXY_TOKEN env)")
 	kimiBin := flag.String("kimi-bin", "kimi", "path to the kimi CLI")
@@ -34,14 +48,18 @@ func main() {
 	attach := flag.String("attach", "", "attach to an already-running kimi web (host:port) instead of spawning one")
 	flag.Parse()
 
+	if *configPath != "" {
+		applyConfigFile(*configPath, server, token, kimiBin, kimiPort, publicHost, attach)
+	}
+
 	if *server == "" {
-		log.Fatal("-server is required")
+		log.Fatal("server is required: use -server or set \"server\" in the config file")
 	}
 	if *token == "" {
 		*token = os.Getenv("KIMI_PROXY_TOKEN")
 	}
 	if *token == "" {
-		log.Fatal("token is required: use -token or KIMI_PROXY_TOKEN")
+		log.Fatal("token is required: use -token, set \"token\" in the config file, or KIMI_PROXY_TOKEN")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -92,6 +110,40 @@ func main() {
 			return
 		}
 		backoff = min(backoff*2, 30*time.Second)
+	}
+}
+
+// applyConfigFile loads the JSON config file and fills in any flag that was
+// not explicitly set on the command line.
+func applyConfigFile(path string, server, token, kimiBin *string, kimiPort *int, publicHost, attach *string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Fatalf("read config %s: %v", path, err)
+	}
+	var cfg fileConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		log.Fatalf("parse config %s: %v", path, err)
+	}
+
+	set := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	if !set["server"] && cfg.Server != "" {
+		*server = cfg.Server
+	}
+	if !set["token"] && cfg.Token != "" {
+		*token = cfg.Token
+	}
+	if !set["kimi-bin"] && cfg.KimiBin != "" {
+		*kimiBin = cfg.KimiBin
+	}
+	if !set["kimi-port"] && cfg.KimiPort != 0 {
+		*kimiPort = cfg.KimiPort
+	}
+	if !set["public-host"] && cfg.PublicHost != "" {
+		*publicHost = cfg.PublicHost
+	}
+	if !set["attach"] && cfg.Attach != "" {
+		*attach = cfg.Attach
 	}
 }
 
