@@ -24,10 +24,6 @@ class KimiProxy < Formula
 
   def caveats
     <<~EOS
-      The repository is private. Before installing or upgrading, export a
-      GitHub token so Homebrew can download the source tarball:
-        export HOMEBREW_GITHUB_API_TOKEN=$(gh auth token)
-
       Edit the config file with your server address and token first:
         #{etc}/kimi-proxy/config.json
 
