@@ -64,6 +64,7 @@ access the web UI at https://kimi.example.com/#token=<你的kimi web bearer toke
 
 ```sh
 brew tap syhily/kimi-proxy https://github.com/syhily/kimi-proxy.git
+export HOMEBREW_GITHUB_API_TOKEN=$(gh auth token)   # 私有仓库下载 tarball 需要
 brew install kimi-proxy
 
 # 编辑配置（server / token / public_host 等）
@@ -73,7 +74,7 @@ $EDITOR "$(brew --prefix)/etc/kimi-proxy/config.json"
 brew services start kimi-proxy
 ```
 
-日志在 `$(brew --prefix)/var/log/kimi-proxy.log`。注意 `brew services` 下 PATH 很精简，如果 `kimi` CLI 不在标准路径，请在配置文件里把 `kimi_bin` 写成绝对路径。仓库为私有，首次安装前确保本机 git 已能通过 GitHub 认证（如 `gh auth login`）。
+日志在 `$(brew --prefix)/var/log/kimi-proxy.log`。注意 `brew services` 下 PATH 很精简，如果 `kimi` CLI 不在标准路径，请在配置文件里把 `kimi_bin` 写成绝对路径。仓库为私有，`HOMEBREW_GITHUB_API_TOKEN` 在安装/升级时都需要；如果本机网络访问 GitHub 受限，再加上 `export https_proxy=http://127.0.0.1:1082`。
 
 ### 配置文件
 

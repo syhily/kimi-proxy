@@ -1,9 +1,8 @@
 class KimiProxy < Formula
   desc "Encrypted KCP tunnel exposing kimi web through a public server"
   homepage "https://github.com/syhily/kimi-proxy"
-  url "https://github.com/syhily/kimi-proxy.git",
-      tag:      "v0.1.1",
-      revision: "a8b63c048e65089bcfc1c408f0d29485b5fadb6c"
+  url "https://github.com/syhily/kimi-proxy/archive/refs/tags/v0.1.1.tar.gz"
+  sha256 "a74a102d90beb7264b24204f6c2549b3e523d9d3971cef608b65e396e5c3bf24"
   head "https://github.com/syhily/kimi-proxy.git", branch: "main"
 
   depends_on "go" => :build
@@ -25,6 +24,10 @@ class KimiProxy < Formula
 
   def caveats
     <<~EOS
+      The repository is private. Before installing or upgrading, export a
+      GitHub token so Homebrew can download the source tarball:
+        export HOMEBREW_GITHUB_API_TOKEN=$(gh auth token)
+
       Edit the config file with your server address and token first:
         #{etc}/kimi-proxy/config.json
 
