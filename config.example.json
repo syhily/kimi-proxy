@@ -4,5 +4,6 @@
   "public_host": "kimi.example.com",
   "kimi_bin": "kimi",
   "kimi_port": 0,
+  "kimi_token": "",
   "tunnel_proto": "kcp"
 }

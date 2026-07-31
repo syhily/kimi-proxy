@@ -95,7 +95,7 @@ brew services start kimi-proxy
 }
 ```
 
-字段与下方 flag 一一对应（`kimi_bin` → `-kimi-bin`，`kimi_port` → `-kimi-port`，`public_host` → `-public-host`，`tunnel_proto` → `-tunnel-proto`），也支持 `"attach"`。
+字段与下方 flag 一一对应（`kimi_bin` → `-kimi-bin`，`kimi_port` → `-kimi-port`，`kimi_token` → `-kimi-token`，`public_host` → `-public-host`，`tunnel_proto` → `-tunnel-proto`），也支持 `"attach"`。
 
 ### Client 参数
 
@@ -107,6 +107,7 @@ brew services start kimi-proxy
 | `-public-host` | 公网域名，传给 `kimi web --allowed-host` 并用于打印访问 URL |
 | `-kimi-bin` | kimi CLI 路径，默认 `kimi` |
 | `-kimi-port` | 指定 kimi web 端口，默认 0（自动选空闲端口） |
+| `-kimi-token` | 固定 kimi web 的 bearer token（以 `KIMI_CODE_PASSWORD` 传给子进程），默认空（kimi web 用持久化随机 token） |
 | `-attach` | 不启动子进程，直接代理到已在运行的 kimi web（如 `127.0.0.1:58627`） |
 | `-tunnel-proto` | 隧道传输：`kcp`（UDP，默认）或 `tcp`（TLS，用于只能映射 TCP 的服务器），需与 Server 一致 |
 

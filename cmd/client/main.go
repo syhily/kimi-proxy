@@ -34,6 +34,7 @@ type fileConfig struct {
 	Token       string `json:"token"`
 	KimiBin     string `json:"kimi_bin"`
 	KimiPort    int    `json:"kimi_port"`
+	KimiToken   string `json:"kimi_token"`
 	PublicHost  string `json:"public_host"`
 	Attach      string `json:"attach"`
 	TunnelProto string `json:"tunnel_proto"`
@@ -45,13 +46,14 @@ func main() {
 	token := flag.String("token", "", "pre-shared token (or KIMI_PROXY_TOKEN env)")
 	kimiBin := flag.String("kimi-bin", "kimi", "path to the kimi CLI")
 	kimiPort := flag.Int("kimi-port", 0, "port for kimi web; 0 picks a free port")
+	kimiToken := flag.String("kimi-token", "", "fixed bearer token for kimi web (passed as KIMI_CODE_PASSWORD); empty keeps the persistent random token")
 	publicHost := flag.String("public-host", "", "public domain used to reach the server; passed to kimi web --allowed-host and used in the access URL hint")
 	attach := flag.String("attach", "", "attach to an already-running kimi web (host:port) instead of spawning one")
 	tunnelProto := flag.String("tunnel-proto", "kcp", "tunnel transport: kcp (UDP) or tcp (TLS)")
 	flag.Parse()
 
 	if *configPath != "" {
-		applyConfigFile(*configPath, server, token, kimiBin, kimiPort, publicHost, attach, tunnelProto)
+		applyConfigFile(*configPath, server, token, kimiBin, kimiPort, kimiToken, publicHost, attach, tunnelProto)
 	}
 
 	if *server == "" {
@@ -82,9 +84,15 @@ func main() {
 			args = append(args, "--allowed-host", *publicHost)
 		}
 		sup := &kimiweb.Supervisor{Bin: *kimiBin, Args: args}
+		if *kimiToken != "" {
+			sup.Env = []string{"KIMI_CODE_PASSWORD=" + *kimiToken}
+		}
 		go sup.Run(ctx)
 		local = fmt.Sprintf("127.0.0.1:%d", port)
 	} else {
+		if *kimiToken != "" {
+			log.Printf("-kimi-token is ignored in -attach mode (the running kimi web keeps its own token)")
+		}
 		log.Printf("attaching to existing kimi web at %s", local)
 	}
 
@@ -93,7 +101,7 @@ func main() {
 		log.Fatalf("kimi web not ready: %v", err)
 	}
 	log.Printf("kimi web is ready at %s", local)
-	printAccessHint(*server, *publicHost)
+	printAccessHint(*server, *publicHost, *kimiToken)
 
 	key := tunnel.DeriveKey(*token)
 	backoff := time.Second
@@ -117,7 +125,7 @@ func main() {
 
 // applyConfigFile loads the JSON config file and fills in any flag that was
 // not explicitly set on the command line.
-func applyConfigFile(path string, server, token, kimiBin *string, kimiPort *int, publicHost, attach, tunnelProto *string) {
+func applyConfigFile(path string, server, token, kimiBin *string, kimiPort *int, kimiToken *string, publicHost, attach, tunnelProto *string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		log.Fatalf("read config %s: %v", path, err)
@@ -140,6 +148,9 @@ func applyConfigFile(path string, server, token, kimiBin *string, kimiPort *int,
 	}
 	if !set["kimi-port"] && cfg.KimiPort != 0 {
 		*kimiPort = cfg.KimiPort
+	}
+	if !set["kimi-token"] && cfg.KimiToken != "" {
+		*kimiToken = cfg.KimiToken
 	}
 	if !set["public-host"] && cfg.PublicHost != "" {
 		*publicHost = cfg.PublicHost
@@ -228,12 +239,17 @@ func runTunnel(ctx context.Context, server, protoName string, key []byte, token,
 	}
 }
 
-// printAccessHint prints the URL to open in the browser, including the
-// persistent bearer token if it can be read from the kimi home directory.
-func printAccessHint(server, publicHost string) {
+// printAccessHint prints the URL to open in the browser. A fixed kimiToken
+// (KIMI_CODE_PASSWORD) takes precedence; otherwise it falls back to the
+// persistent bearer token read from the kimi home directory.
+func printAccessHint(server, publicHost, kimiToken string) {
 	host := publicHost
 	if host == "" {
 		host = strings.Split(server, ":")[0]
+	}
+	if kimiToken != "" {
+		log.Printf("access the web UI at http://%s/#token=%s", host, kimiToken)
+		return
 	}
 	token, err := os.ReadFile(serverTokenPath())
 	if err != nil {

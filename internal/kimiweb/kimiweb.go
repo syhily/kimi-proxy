@@ -16,6 +16,8 @@ import (
 type Supervisor struct {
 	Bin  string
 	Args []string
+	// Env holds extra KEY=VALUE entries appended to the inherited environment.
+	Env []string
 }
 
 // Run starts the process and blocks until ctx is cancelled (which kills the
@@ -26,6 +28,9 @@ func (s *Supervisor) Run(ctx context.Context) {
 		cmd := exec.CommandContext(ctx, s.Bin, s.Args...)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
+		if len(s.Env) > 0 {
+			cmd.Env = append(os.Environ(), s.Env...)
+		}
 		if err := cmd.Start(); err != nil {
 			log.Printf("[kimiweb] failed to start %q: %v", s.Bin, err)
 			select {
