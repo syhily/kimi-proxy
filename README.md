@@ -58,10 +58,44 @@ access the web UI at https://kimi.example.com/#token=<你的kimi web bearer toke
 
 浏览器打开该地址即可使用网页版 Kimi Code。Web UI 自身的 bearer token 鉴权仍然生效，隧道只是传输通道。
 
+### Homebrew 安装（macOS）
+
+本仓库同时是一个 Homebrew tap，可直接安装并托管为后台服务：
+
+```sh
+brew tap syhily/kimi-proxy https://github.com/syhily/kimi-proxy.git
+brew install kimi-proxy
+
+# 编辑配置（server / token / public_host 等）
+$EDITOR "$(brew --prefix)/etc/kimi-proxy/config.json"
+
+# 用 launchd 托管，开机自启、崩溃自动拉起
+brew services start kimi-proxy
+```
+
+日志在 `$(brew --prefix)/var/log/kimi-proxy.log`。注意 `brew services` 下 PATH 很精简，如果 `kimi` CLI 不在标准路径，请在配置文件里把 `kimi_bin` 写成绝对路径。仓库为私有，首次安装前确保本机 git 已能通过 GitHub 认证（如 `gh auth login`）。
+
+### 配置文件
+
+`-config` 指定一个 JSON 配置文件（见 `config.example.json`），命令行 flag 优先于配置文件：
+
+```json
+{
+  "server": "kimi.example.com:7000",
+  "token": "与 Server 相同的字符串",
+  "public_host": "kimi.example.com",
+  "kimi_bin": "kimi",
+  "kimi_port": 0
+}
+```
+
+字段与下方 flag 一一对应（`kimi_bin` → `-kimi-bin`，`kimi_port` → `-kimi-port`，`public_host` → `-public-host`），也支持 `"attach"`。
+
 ### Client 参数
 
 | 参数 | 说明 |
 | --- | --- |
+| `-config` | JSON 配置文件路径，flag 优先于文件中的值 |
 | `-server` | Server 隧道地址 `host:port`（必填） |
 | `-token` | 共享密钥，或用 `KIMI_PROXY_TOKEN` 环境变量 |
 | `-public-host` | 公网域名，传给 `kimi web --allowed-host` 并用于打印访问 URL |
