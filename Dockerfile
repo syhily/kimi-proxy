@@ -2,7 +2,10 @@
 FROM golang:1.24-alpine AS build
 WORKDIR /src
 
-# Dependencies are vendored (vendor/), so the build needs no network access.
+# Download dependencies first for better layer caching
+COPY go.mod go.sum ./
+RUN go mod download
+
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/server ./cmd/server
 
