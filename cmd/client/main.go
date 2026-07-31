@@ -30,12 +30,13 @@ const authTimeout = 15 * time.Second
 // from a JSON file (e.g. by the Homebrew launchd service). Explicit flags
 // take precedence over file values, which take precedence over env vars.
 type fileConfig struct {
-	Server     string `json:"server"`
-	Token      string `json:"token"`
-	KimiBin    string `json:"kimi_bin"`
-	KimiPort   int    `json:"kimi_port"`
-	PublicHost string `json:"public_host"`
-	Attach     string `json:"attach"`
+	Server      string `json:"server"`
+	Token       string `json:"token"`
+	KimiBin     string `json:"kimi_bin"`
+	KimiPort    int    `json:"kimi_port"`
+	PublicHost  string `json:"public_host"`
+	Attach      string `json:"attach"`
+	TunnelProto string `json:"tunnel_proto"`
 }
 
 func main() {
@@ -46,10 +47,11 @@ func main() {
 	kimiPort := flag.Int("kimi-port", 0, "port for kimi web; 0 picks a free port")
 	publicHost := flag.String("public-host", "", "public domain used to reach the server; passed to kimi web --allowed-host and used in the access URL hint")
 	attach := flag.String("attach", "", "attach to an already-running kimi web (host:port) instead of spawning one")
+	tunnelProto := flag.String("tunnel-proto", "kcp", "tunnel transport: kcp (UDP) or tcp (TLS)")
 	flag.Parse()
 
 	if *configPath != "" {
-		applyConfigFile(*configPath, server, token, kimiBin, kimiPort, publicHost, attach)
+		applyConfigFile(*configPath, server, token, kimiBin, kimiPort, publicHost, attach, tunnelProto)
 	}
 
 	if *server == "" {
@@ -99,7 +101,7 @@ func main() {
 		if ctx.Err() != nil {
 			return
 		}
-		err := runTunnel(ctx, *server, key, *token, local)
+		err := runTunnel(ctx, *server, *tunnelProto, key, *token, local)
 		if ctx.Err() != nil {
 			return
 		}
@@ -115,7 +117,7 @@ func main() {
 
 // applyConfigFile loads the JSON config file and fills in any flag that was
 // not explicitly set on the command line.
-func applyConfigFile(path string, server, token, kimiBin *string, kimiPort *int, publicHost, attach *string) {
+func applyConfigFile(path string, server, token, kimiBin *string, kimiPort *int, publicHost, attach, tunnelProto *string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		log.Fatalf("read config %s: %v", path, err)
@@ -145,12 +147,24 @@ func applyConfigFile(path string, server, token, kimiBin *string, kimiPort *int,
 	if !set["attach"] && cfg.Attach != "" {
 		*attach = cfg.Attach
 	}
+	if !set["tunnel-proto"] && cfg.TunnelProto != "" {
+		*tunnelProto = cfg.TunnelProto
+	}
 }
 
 // runTunnel establishes one authenticated tunnel session and serves streams
 // until the connection breaks.
-func runTunnel(ctx context.Context, server string, key []byte, token, local string) error {
-	conn, err := tunnel.DialKCP(server, key)
+func runTunnel(ctx context.Context, server, protoName string, key []byte, token, local string) error {
+	var conn net.Conn
+	var err error
+	switch protoName {
+	case "kcp":
+		conn, err = tunnel.DialKCP(server, key)
+	case "tcp":
+		conn, err = tunnel.DialTCP(server, key)
+	default:
+		return fmt.Errorf("unknown tunnel transport %q: want kcp or tcp", protoName)
+	}
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", server, err)
 	}

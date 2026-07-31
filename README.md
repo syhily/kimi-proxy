@@ -8,8 +8,8 @@
 
 特性：
 
-- Server 与 Client 之间走 KCP（UDP），AES-256-GCM 加密，密钥由共享 token 派生（SHA-256），错误 token 在加密层就无法通信。
-- 单条 KCP 连接上用 smux 复用任意数量的并发 HTTP/WebSocket 流。
+- Server 与 Client 之间的隧道支持两种传输：KCP（UDP，AES-256-GCM 加密）或 TCP（TLS 1.3，证书密钥同样由共享 token 派生，client 固定校验服务端身份）。密钥/身份均由共享 token 经 SHA-256 派生，错误 token 在加密层就无法通信。TCP 模式用于只能映射 TCP 端口的服务器。
+- 单条隧道连接上用 smux 复用任意数量的并发 HTTP/WebSocket 流。
 - Client 启动后自动拉起 `kimi web --port <空闲端口> --no-open` 子进程，崩溃自动重启；隧道断线自动重连。
 - 通过 `-public-host` 把公网域名传给 `kimi web --allowed-host`，绕过 Host 头（DNS rebinding）检查。
 
@@ -29,7 +29,12 @@ go build -o bin/client ./cmd/client
 # token 也可用环境变量：KIMI_PROXY_TOKEN=... ./server
 ```
 
-- `-tunnel-addr`：KCP 隧道监听地址，**UDP** 端口，需在防火墙/安全组放行。
+- `-tunnel-addr`：隧道监听地址。默认 KCP（**UDP**），需在防火墙/安全组放行 UDP；如果服务器只能映射 TCP 端口，加 `-tunnel-proto tcp`（TLS 加密），映射 TCP 即可：
+
+```sh
+./server -tunnel-proto tcp -tunnel-addr :7000 -http-addr :8080 -token '...'
+# Docker: -p 31134:7000/tcp，并把 -tunnel-proto tcp 加在启动参数里
+```
 - `-http-addr`：公网 HTTP 入口。建议前面套一层 Caddy/Nginx 终止 TLS 并绑定域名：
 
 ```caddyfile
@@ -85,11 +90,12 @@ brew services start kimi-proxy
   "token": "与 Server 相同的字符串",
   "public_host": "kimi.example.com",
   "kimi_bin": "kimi",
-  "kimi_port": 0
+  "kimi_port": 0,
+  "tunnel_proto": "kcp"
 }
 ```
 
-字段与下方 flag 一一对应（`kimi_bin` → `-kimi-bin`，`kimi_port` → `-kimi-port`，`public_host` → `-public-host`），也支持 `"attach"`。
+字段与下方 flag 一一对应（`kimi_bin` → `-kimi-bin`，`kimi_port` → `-kimi-port`，`public_host` → `-public-host`，`tunnel_proto` → `-tunnel-proto`），也支持 `"attach"`。
 
 ### Client 参数
 
@@ -102,6 +108,7 @@ brew services start kimi-proxy
 | `-kimi-bin` | kimi CLI 路径，默认 `kimi` |
 | `-kimi-port` | 指定 kimi web 端口，默认 0（自动选空闲端口） |
 | `-attach` | 不启动子进程，直接代理到已在运行的 kimi web（如 `127.0.0.1:58627`） |
+| `-tunnel-proto` | 隧道传输：`kcp`（UDP，默认）或 `tcp`（TLS，用于只能映射 TCP 的服务器），需与 Server 一致 |
 
 ## 安全说明
 

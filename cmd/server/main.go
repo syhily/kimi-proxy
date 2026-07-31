@@ -23,9 +23,10 @@ const authTimeout = 15 * time.Second
 var current atomic.Value // holds *smux.Session of the connected client
 
 func main() {
-	tunnelAddr := flag.String("tunnel-addr", ":7000", "KCP tunnel listen address (UDP)")
+	tunnelAddr := flag.String("tunnel-addr", ":7000", "tunnel listen address (KCP/UDP, or TCP with -tunnel-proto tcp)")
 	httpAddr := flag.String("http-addr", ":8080", "public HTTP listen address (TCP)")
 	token := flag.String("token", "", "pre-shared token (or KIMI_PROXY_TOKEN env)")
+	tunnelProto := flag.String("tunnel-proto", "kcp", "tunnel transport: kcp (UDP) or tcp (TLS)")
 	flag.Parse()
 
 	if *token == "" {
@@ -35,19 +36,33 @@ func main() {
 		log.Fatal("token is required: use -token or KIMI_PROXY_TOKEN")
 	}
 
-	ln, err := tunnel.ListenKCP(*tunnelAddr, tunnel.DeriveKey(*token))
-	if err != nil {
-		log.Fatalf("listen tunnel %s: %v", *tunnelAddr, err)
+	key := tunnel.DeriveKey(*token)
+	var ln net.Listener
+	switch *tunnelProto {
+	case "kcp":
+		kl, err := tunnel.ListenKCP(*tunnelAddr, key)
+		if err != nil {
+			log.Fatalf("listen tunnel %s: %v", *tunnelAddr, err)
+		}
+		ln = kl
+	case "tcp":
+		tl, err := tunnel.ListenTCP(*tunnelAddr, key)
+		if err != nil {
+			log.Fatalf("listen tunnel %s: %v", *tunnelAddr, err)
+		}
+		ln = tl
+	default:
+		log.Fatalf("unknown -tunnel-proto %q: want kcp or tcp", *tunnelProto)
 	}
-	log.Printf("tunnel listening on %s (KCP/UDP)", *tunnelAddr)
+	log.Printf("tunnel listening on %s (%s)", *tunnelAddr, *tunnelProto)
 	go func() {
 		for {
-			conn, err := ln.AcceptKCP()
+			conn, err := ln.Accept()
 			if err != nil {
 				log.Printf("accept tunnel: %v", err)
 				return
 			}
-			tunnel.Tune(conn)
+			tunnel.TuneConn(conn)
 			go handleTunnelConn(conn, *token)
 		}
 	}()

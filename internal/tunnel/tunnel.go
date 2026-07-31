@@ -1,5 +1,6 @@
-// Package tunnel provides the shared KCP + smux plumbing used by both the
-// kimi-proxy server and client.
+// Package tunnel provides the shared encrypted-tunnel plumbing used by both
+// the kimi-proxy server and client: KCP (UDP) or TLS (TCP) transport, with
+// smux multiplexing on top.
 package tunnel
 
 import (
@@ -49,6 +50,14 @@ func Tune(conn *kcp.UDPSession) {
 	conn.SetNoDelay(1, 10, 2, 1)
 	conn.SetWindowSize(256, 256)
 	conn.SetMtu(1350)
+}
+
+// TuneConn applies Tune when conn is a KCP session; other transports (TLS
+// over TCP) are left untouched.
+func TuneConn(conn net.Conn) {
+	if uc, ok := conn.(*kcp.UDPSession); ok {
+		Tune(uc)
+	}
 }
 
 // SmuxConfig returns the multiplexing configuration shared by both ends.

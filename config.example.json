@@ -3,5 +3,6 @@
   "token": "换成强随机字符串（与 Server 相同）",
   "public_host": "kimi.example.com",
   "kimi_bin": "kimi",
-  "kimi_port": 0
+  "kimi_port": 0,
+  "tunnel_proto": "kcp"
 }
