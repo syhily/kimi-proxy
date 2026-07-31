@@ -16,9 +16,10 @@ COPY --from=build /out/server /usr/local/bin/server
 
 USER app
 
-# KCP tunnel (UDP) and public HTTP entry (TCP)
-EXPOSE 7000/udp 8080/tcp
+# TLS-over-TCP tunnel (default; works on TCP-only platforms) and public HTTP
+# entry. For KCP/UDP, expose 7000/udp and pass -tunnel-proto kcp instead.
+EXPOSE 7000/tcp 8080/tcp
 
 # Token is read from KIMI_PROXY_TOKEN; flags can override via CMD.
 ENTRYPOINT ["server"]
-CMD ["-tunnel-addr", ":7000", "-http-addr", ":8080"]
+CMD ["-tunnel-proto", "tcp", "-tunnel-addr", ":7000", "-http-addr", ":8080"]
