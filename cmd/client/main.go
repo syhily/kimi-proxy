@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -24,7 +25,14 @@ import (
 	"github.com/xtaci/smux"
 )
 
-const authTimeout = 15 * time.Second
+const (
+	authTimeout = 15 * time.Second
+	// heartbeatTimeout is how long the client waits for a pong before it
+	// tears the session down and reconnects. It is shorter than the smux
+	// keepalive timeout, so a half-dead control path is detected at the
+	// application layer first.
+	heartbeatTimeout = 60 * time.Second
+)
 
 // fileConfig mirrors the command-line flags so the client can be configured
 // from a JSON file (e.g. by the Homebrew launchd service). Explicit flags
@@ -103,13 +111,12 @@ func main() {
 	log.Printf("kimi web is ready at %s", local)
 	printAccessHint(*server, *publicHost, *kimiToken)
 
-	key := tunnel.DeriveKey(*token)
 	backoff := time.Second
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		err := runTunnel(ctx, *server, *tunnelProto, key, *token, local)
+		err := runTunnel(ctx, *server, *tunnelProto, *token, local)
 		if ctx.Err() != nil {
 			return
 		}
@@ -165,14 +172,14 @@ func applyConfigFile(path string, server, token, kimiBin *string, kimiPort *int,
 
 // runTunnel establishes one authenticated tunnel session and serves streams
 // until the connection breaks.
-func runTunnel(ctx context.Context, server, protoName string, key []byte, token, local string) error {
+func runTunnel(ctx context.Context, server, protoName, token, local string) error {
 	var conn net.Conn
 	var err error
 	switch protoName {
 	case "kcp":
-		conn, err = tunnel.DialKCP(server, key)
+		conn, err = tunnel.DialKCP(server, tunnel.DeriveKCPKey(token))
 	case "tcp":
-		conn, err = tunnel.DialTCP(server, key)
+		conn, err = tunnel.DialTCP(server, token)
 	default:
 		return fmt.Errorf("unknown tunnel transport %q: want kcp or tcp", protoName)
 	}
@@ -205,6 +212,25 @@ func runTunnel(ctx context.Context, server, protoName string, key []byte, token,
 	}
 	log.Printf("tunnel established to %s", server)
 
+	// Track the last pong so the heartbeat is bidirectional: the server
+	// answers every ping, and a long silence means the control path is
+	// half-dead (e.g. the server goroutine is stuck) even though the smux
+	// session still looks healthy.
+	var lastPong atomic.Int64
+	lastPong.Store(time.Now().UnixNano())
+	go func() {
+		for {
+			var reply proto.Message
+			if err := proto.Read(ctrl, &reply); err != nil {
+				_ = sess.Close()
+				return
+			}
+			if reply.Type == proto.TypePong {
+				lastPong.Store(time.Now().UnixNano())
+			}
+		}
+	}()
+
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
@@ -215,6 +241,11 @@ func runTunnel(ctx context.Context, server, protoName string, key []byte, token,
 				return
 			case <-ticker.C:
 				if err := proto.Write(ctrl, &proto.Message{Type: proto.TypePing}); err != nil {
+					_ = sess.Close()
+					return
+				}
+				if time.Since(time.Unix(0, lastPong.Load())) > heartbeatTimeout {
+					log.Printf("server heartbeat lost, reconnecting")
 					_ = sess.Close()
 					return
 				}
@@ -234,7 +265,11 @@ func runTunnel(ctx context.Context, server, protoName string, key []byte, token,
 				_ = stream.Close()
 				return
 			}
-			tunnel.Pipe(upstream, stream)
+			// No idle timeout on the client: the hop to the local kimi web is
+			// trusted, and the server already guards the public side. An idle
+			// timeout here would kill WebSocket connections while the user
+			// thinks or reads, exactly when they must stay open.
+			tunnel.Pipe(upstream, stream, 0)
 		}()
 	}
 }

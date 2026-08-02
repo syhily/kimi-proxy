@@ -8,9 +8,11 @@
 
 特性：
 
-- 隧道支持两种传输：**KCP**（UDP，AES-256-GCM 加密）或 **TCP**（TLS 1.3）。密钥/证书身份均由共享 token 经 SHA-256 派生，client 固定校验服务端身份，错误 token 在加密层就无法通信。TCP 模式用于只能映射 TCP 端口的服务器。
+- 隧道支持两种传输：**KCP**（UDP，AES-256-GCM 加密）或 **TCP**（TLS 1.3）。密钥/证书身份均由共享 token 经 HKDF-SHA256 按用途独立派生，client 与 server **双向固定校验**对方身份，错误 token 在加密层就无法通信。TCP 模式用于只能映射 TCP 端口的服务器。
 - 单条隧道连接上用 smux 复用任意数量的并发 HTTP/WebSocket 流。
 - Client 启动后自动拉起 `kimi web` 子进程（可固定端口和 bearer token），崩溃自动重启；隧道断线指数退避重连。
+- 隧道双向保活：smux 层每 10s 互发 keepalive 帧（90s 无响应才判死，容忍网络抖动）；控制流另有应用层心跳（client 每 10s ping，server 回 pong，client 连续 60s 收不到 pong 即主动重连，比被动等待更快恢复）。
+- TCP 模式隧道连接两端自动调优：`TCP_NODELAY` 低延迟 + keepalive（60s 空闲、15s 间隔、3 次探测，约 105s 识别半开连接/网络黑洞，先于 smux 超时释放悬挂连接）。
 - 通过 `-public-host` 把公网域名传给 `kimi web --allowed-host`，绕过 Host 头（DNS rebinding）检查。
 
 ## 构建
@@ -51,8 +53,12 @@ docker run -d --name kimi-proxy \
 | `-http-addr` | 公网 HTTP 入口，默认 `:8080`（TCP） |
 | `-token` | 共享密钥（必填），或用 `KIMI_PROXY_TOKEN` 环境变量 |
 | `-tunnel-proto` | 隧道传输：`kcp`（UDP，默认）或 `tcp`（TLS 1.3，用于只能映射 TCP 端口的服务器） |
+| `-http-max-conns` | 公网 HTTP 最大并发连接数，默认 `256`，超限直接返回 503（防连接洪泛） |
+| `-http-idle-timeout` | 转发连接空闲超时，默认 `10m`（`0` 关闭）。WebSocket 升级连接自动豁免（对话思考、挂机时不断连），只清理"连接了却不发数据的慢速占用" |
+| `-tunnel-max-conns` | 隧道最大并发连接数（含未认证），默认 `8`。真实 client 只有 1 个，留足冗余防止被占满后无法重连 |
+| `-tls-cert` / `-tls-key` | 可选，成对提供后 HTTP 入口直接启用 HTTPS（TLS 1.2+），无需前置 Caddy/Nginx |
 
-`-http-addr` 建议前面套一层 Caddy/Nginx 终止 TLS 并绑定域名：
+`-http-addr` 可以前面套一层 Caddy/Nginx 终止 TLS 并绑定域名（未提供 `-tls-cert/-tls-key` 时建议）：
 
 ```caddyfile
 kimi.example.com {
@@ -146,7 +152,17 @@ brew services start kimi-proxy
 
 ## 安全说明
 
-- 隧道 token 请使用强随机值（如 `openssl rand -base64 32`），它同时是加密密钥/证书身份的种子。
-- 不要把 Server 的 `-http-addr` 直接裸暴露在公网 HTTP 上，前面务必加 TLS。
-- `kimi web` 的 bearer token 是公网访问的唯一鉴权屏障，用 `-kimi-token` 固定时同样要使用强随机值。
+- 隧道 token 请使用强随机值（如 `openssl rand -base64 32`）。它经 HKDF-SHA256 按用途独立派生为 KCP 加密密钥和 TLS 证书身份，两种用途的密钥互不通用。
+- **v2 起 client 与 server 必须同步升级**：密钥派生方式已改变，且 TCP 模式改为双向证书固定，旧版与本版互相无法通信。
+- TCP 隧道模式下，双方都固定校验对端证书公钥：不知道 token 的连接在 TLS 握手阶段就会被拒绝。
+- 不要把 Server 的 `-http-addr` 直接裸暴露在公网 HTTP 上，前面务必加 TLS（前置 Caddy/Nginx，或直接使用 `-tls-cert/-tls-key`）。
+- `kimi web` 的 bearer token 是公网访问的最终鉴权屏障，用 `-kimi-token` 固定时同样要使用强随机值。
+- KCP 模式使用 UDP，无法在应用层拦截伪造源地址的洪水包（kcp-go 内部会为任意来源的包建立会话）。如服务器暴露公网 UDP 端口，建议用防火墙对 `-tunnel-addr` 端口限速，例如：
+
+  ```sh
+  # 仅示例：对 7000/udp 限速（iptables）
+  iptables -A INPUT -p udp --dport 7000 -m limit --limit 100/s --limit-burst 200 -j ACCEPT
+  iptables -A INPUT -p udp --dport 7000 -j DROP
+  ```
+
 - `kimi web` 仍绑定 `127.0.0.1`；不要给它加 `--dangerous-bypass-auth`。
