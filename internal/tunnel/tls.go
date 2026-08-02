@@ -38,6 +38,11 @@ func tlsIdentity(seed []byte) (tls.Certificate, ed25519.PublicKey, error) {
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv}, pub, nil
 }
 
+// ErrPeerIdentityMismatch is returned when the peer's TLS certificate does
+// not carry the public key derived from the shared token. The server uses it
+// to identify abusive peers and temporarily ban their IP.
+var ErrPeerIdentityMismatch = errors.New("tunnel: peer identity mismatch (wrong token?)")
+
 // verifyPeer pins the peer's leaf certificate public key to want. It is used
 // on both ends: the client pins the server, the server pins the client.
 func verifyPeer(rawCerts [][]byte, want ed25519.PublicKey) error {
@@ -50,7 +55,7 @@ func verifyPeer(rawCerts [][]byte, want ed25519.PublicKey) error {
 	}
 	certPub, ok := cert.PublicKey.(ed25519.PublicKey)
 	if !ok || !bytes.Equal(certPub, want) {
-		return errors.New("tunnel: peer identity mismatch (wrong token?)")
+		return ErrPeerIdentityMismatch
 	}
 	return nil
 }

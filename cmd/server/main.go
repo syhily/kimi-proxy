@@ -28,12 +28,20 @@ import (
 )
 
 const (
-	authTimeout   = 15 * time.Second
-	headerTimeout = 15 * time.Second
-	shutdownGrace = 5 * time.Second
+	authTimeout       = 15 * time.Second
+	headerTimeout     = 15 * time.Second
+	streamOpenTimeout = 5 * time.Second
+	shutdownGrace     = 5 * time.Second
+	// Bounds for the WebSocket upgrade probe.
+	maxHeaderLines = 64
+	maxHeaderBytes = 64 * 1024
 )
 
 var current atomic.Value // holds *smux.Session of the connected client
+
+// authBan holds IPs that failed tunnel authentication. It is only populated
+// on the TCP transport, where source IPs cannot be spoofed.
+var authBan = newIPBan()
 
 func main() {
 	tunnelAddr := flag.String("tunnel-addr", ":7000", "tunnel listen address (KCP/UDP, or TCP with -tunnel-proto tcp)")
@@ -42,6 +50,10 @@ func main() {
 	tunnelProto := flag.String("tunnel-proto", "kcp", "tunnel transport: kcp (UDP) or tcp (TLS)")
 	httpMaxConns := flag.Int("http-max-conns", 256, "maximum concurrent public HTTP connections")
 	httpIdleTimeout := flag.Duration("http-idle-timeout", tunnel.DefaultPipeIdle, "close proxied connections idle for this long (0 disables)")
+	httpMaxDuration := flag.Duration("http-max-duration", 24*time.Hour, "close proxied connections after this total lifetime, even if active (0 disables)")
+	tunnelConnRate := flag.Float64("tunnel-conns-per-ip", 5, "max new tunnel connections per second per IP, burst 2x (0 disables)")
+	httpConnRate := flag.Float64("http-conns-per-ip", 50, "max new HTTP connections per second per IP, burst 2x (0 disables)")
+	authFailBan := flag.Duration("auth-fail-ban", 10*time.Minute, "ban the IP of connections that fail authentication for this long (0 disables; TCP mode only)")
 	tunnelMaxConns := flag.Int("tunnel-max-conns", 8, "maximum concurrent tunnel connections, including unauthenticated ones")
 	tlsCert := flag.String("tls-cert", "", "TLS certificate for the public HTTP entry (requires -tls-key); enables HTTPS directly")
 	tlsKey := flag.String("tls-key", "", "TLS private key for the public HTTP entry")
@@ -104,11 +116,11 @@ func main() {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		serveTunnel(ctx, ln, tunnelSlots, *token)
+		serveTunnel(ctx, ln, tunnelSlots, *token, newIPLimiter(*tunnelConnRate, *tunnelConnRate*2), *authFailBan)
 	}()
 	go func() {
 		defer wg.Done()
-		serveHTTP(ctx, httpLn, httpSlots, *httpIdleTimeout)
+		serveHTTP(ctx, httpLn, httpSlots, *httpIdleTimeout, *httpMaxDuration, newIPLimiter(*httpConnRate, *httpConnRate*2))
 	}()
 
 	<-ctx.Done()
@@ -130,16 +142,35 @@ func main() {
 // serveTunnel accepts tunnel connections until the listener is closed or the
 // context is cancelled. A slot semaphore bounds the number of concurrent
 // connections, including unauthenticated ones, so a flood of connections
-// cannot exhaust goroutines and smux sessions.
-func serveTunnel(ctx context.Context, ln net.Listener, slots chan struct{}, token string) {
+// cannot exhaust goroutines and smux sessions. Per-IP rate limiting and the
+// auth-fail ban table reject abusive peers before any TLS or smux work.
+func serveTunnel(ctx context.Context, ln net.Listener, slots chan struct{}, token string, limiter *ipLimiter, banDuration time.Duration) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return
 			}
-			log.Printf("accept tunnel: %v", err)
-			return
+			// Transient failures (e.g. EMFILE) must not kill the server:
+			// back off briefly and keep accepting.
+			log.Printf("accept tunnel: %v; retrying", err)
+			select {
+			case <-time.After(time.Second):
+			case <-ctx.Done():
+				return
+			}
+			continue
+		}
+		ip := remoteIP(conn)
+		if authBan.blocked(ip) {
+			log.Printf("rejecting banned IP %s", ip)
+			_ = conn.Close()
+			continue
+		}
+		if !limiter.allow(ip) {
+			log.Printf("rate limiting IP %s", ip)
+			_ = conn.Close()
+			continue
 		}
 		tunnel.TuneConn(conn)
 		select {
@@ -151,7 +182,7 @@ func serveTunnel(ctx context.Context, ln net.Listener, slots chan struct{}, toke
 		}
 		go func() {
 			defer func() { <-slots }()
-			handleTunnelConn(conn, token)
+			handleTunnelConn(conn, token, banDuration)
 		}()
 	}
 }
@@ -159,15 +190,25 @@ func serveTunnel(ctx context.Context, ln net.Listener, slots chan struct{}, toke
 // serveHTTP accepts public HTTP connections until the listener is closed or
 // the context is cancelled, bounding concurrency with a slot semaphore so
 // that a connection flood cannot open unlimited streams to the client.
-func serveHTTP(ctx context.Context, ln net.Listener, slots chan struct{}, idle time.Duration) {
+func serveHTTP(ctx context.Context, ln net.Listener, slots chan struct{}, idle, lifetime time.Duration, limiter *ipLimiter) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return
 			}
-			log.Printf("accept http: %v", err)
-			return
+			log.Printf("accept http: %v; retrying", err)
+			select {
+			case <-time.After(time.Second):
+			case <-ctx.Done():
+				return
+			}
+			continue
+		}
+		if !limiter.allow(remoteIP(conn)) {
+			log.Printf("rate limiting HTTP IP %s", conn.RemoteAddr())
+			_ = conn.Close()
+			continue
 		}
 		select {
 		case slots <- struct{}{}:
@@ -177,14 +218,61 @@ func serveHTTP(ctx context.Context, ln net.Listener, slots chan struct{}, idle t
 		}
 		go func() {
 			defer func() { <-slots }()
-			handleHTTP(conn, idle)
+			handleHTTP(conn, idle, lifetime)
 		}()
 	}
 }
 
+// remoteIP extracts the IP part of a connection's remote address.
+func remoteIP(conn net.Conn) string {
+	host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+	if err != nil {
+		return conn.RemoteAddr().String()
+	}
+	return host
+}
+
+// alertBadCertificate is the TLS alert (RFC 8446 §6.2) a peer sends when it
+// rejects our certificate.
+const alertBadCertificate = "tls: bad certificate"
+
+// isBadCertificateAlert reports whether the peer aborted the handshake by
+// rejecting our certificate. A legitimate client with the correct token can
+// never produce it: both sides pin the same derived identity, so it is a
+// reliable signal of an abusive peer — even when it rejects us before we get
+// to see its certificate (which is what happens when the peer pins us against
+// a wrong token). crypto/tls wraps the alert in a net.OpError with an
+// unexported error value, so it is identified by its message.
+func isBadCertificateAlert(err error) bool {
+	var opErr *net.OpError
+	if !errors.As(err, &opErr) || opErr.Op != "remote error" {
+		return false
+	}
+	return opErr.Err != nil && opErr.Err.Error() == alertBadCertificate
+}
+
 // handleTunnelConn authenticates a new client connection and, on success,
-// registers its smux session as the active one.
-func handleTunnelConn(conn net.Conn, token string) {
+// registers its smux session as the active one. On the TCP transport the TLS
+// handshake is driven explicitly so a rejected peer identity can be recorded
+// in the ban table; UDP peers are never banned, because their source IP can
+// be forged.
+func handleTunnelConn(conn net.Conn, token string, banDuration time.Duration) {
+	// One deadline covers the whole pre-auth phase for every transport: the
+	// TLS handshake, smux framing, the control stream accept, and the auth
+	// message. A peer that connects but never completes authentication
+	// cannot hold a slot beyond authTimeout.
+	_ = conn.SetReadDeadline(time.Now().Add(authTimeout))
+	if tc, ok := conn.(*tls.Conn); ok {
+		err := tc.Handshake()
+		if err != nil {
+			log.Printf("tls handshake: %v", err)
+			if errors.Is(err, tunnel.ErrPeerIdentityMismatch) || isBadCertificateAlert(err) {
+				authBan.ban(remoteIP(conn), banDuration)
+			}
+			_ = conn.Close()
+			return
+		}
+	}
 	sess, err := smux.Server(conn, tunnel.SmuxConfig())
 	if err != nil {
 		log.Printf("smux server: %v", err)
@@ -213,6 +301,12 @@ func handleTunnelConn(conn net.Conn, token string) {
 	if !ok {
 		_ = proto.Write(ctrl, &proto.Message{Type: proto.TypeAuthFail, Text: "invalid token or protocol version"})
 		log.Printf("rejected client %s: bad auth", conn.RemoteAddr())
+		// The transport already authenticated this peer, so a wrong token
+		// here means the token changed or is being brute-forced. Ban the IP
+		// on TCP, where the address cannot be forged.
+		if _, isTLS := conn.(*tls.Conn); isTLS {
+			authBan.ban(remoteIP(conn), banDuration)
+		}
 		_ = sess.Close()
 		return
 	}
@@ -252,30 +346,55 @@ func handleTunnelConn(conn net.Conn, token string) {
 
 // handleHTTP proxies one public HTTP connection to the client through a new
 // smux stream. When no client is connected it answers a plain 503.
-func handleHTTP(conn net.Conn, idle time.Duration) {
-	if tc, ok := conn.(*net.TCPConn); ok {
-		_ = tc.SetKeepAlive(true)
-		_ = tc.SetKeepAlivePeriod(60 * time.Second)
-	}
+func handleHTTP(conn net.Conn, idle, lifetime time.Duration) {
+	tunnel.TuneConn(conn)
 	sess, _ := current.Load().(*smux.Session)
 	if sess == nil || sess.IsClosed() {
 		write503(conn, "kimi-proxy: no client connected")
 		return
 	}
-	stream, err := sess.OpenStream()
-	if err != nil {
-		write503(conn, "kimi-proxy: failed to open tunnel stream")
+	// Open the stream with a timeout: if the client vanished and the session
+	// is not yet marked dead, OpenStream could otherwise hang for the whole
+	// smux keepalive window, leaving the request stuck.
+	type streamResult struct {
+		s   *smux.Stream
+		err error
+	}
+	ch := make(chan streamResult, 1)
+	go func() {
+		s, err := sess.OpenStream()
+		if err == nil {
+			// If the caller already gave up on the timeout path, this
+			// deadline reaps the stream shortly after it is established.
+			_ = s.SetDeadline(time.Now().Add(streamOpenTimeout))
+		}
+		ch <- streamResult{s, err}
+	}()
+	var stream *smux.Stream
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			write503(conn, "kimi-proxy: failed to open tunnel stream")
+			return
+		}
+		stream = r.s
+		// Clear the reaper deadline set by the opener: the pipe below
+		// installs its own (and a WebSocket with idle/lifetime disabled must
+		// not inherit a 5-second expiry).
+		_ = stream.SetDeadline(time.Time{})
+	case <-time.After(streamOpenTimeout):
+		write503(conn, "kimi-proxy: tunnel stream open timed out")
 		return
 	}
 	// WebSocket connections legitimately stay silent for minutes (while the
-	// user reads a reply or the model thinks), so they must not be killed by
-	// the idle timeout. The probe spools everything it reads, so the stream
-	// itself is unaffected.
+	// user reads a reply or the model thinks), so they are exempted from the
+	// idle timeout. They still respect the total lifetime bound, so a peer
+	// claiming to be a WebSocket cannot hold a connection forever.
 	pc := newProbeConn(conn)
 	if isWebSocketUpgrade(pc) {
 		idle = 0
 	}
-	tunnel.Pipe(pc, stream, idle)
+	tunnel.Pipe(pc, stream, idle, lifetime)
 }
 
 // probeConn lets the WebSocket probe consume the request headers without
@@ -292,15 +411,17 @@ type probeConn struct {
 
 func newProbeConn(conn net.Conn) *probeConn {
 	p := &probeConn{Conn: conn, record: true}
-	p.r = bufio.NewReader(&probeSource{p})
+	// 16 KiB buffer: enough for any realistic request header line, while
+	// bounding how much a peer can make us spool per connection.
+	p.r = bufio.NewReaderSize(&spoolingSource{p}, 16*1024)
 	return p
 }
 
-// probeSource is the read path bufio uses; it feeds the spool while the
+// spoolingSource is the read path bufio uses; it feeds the spool while the
 // probe is active.
-type probeSource struct{ p *probeConn }
+type spoolingSource struct{ p *probeConn }
 
-func (s *probeSource) Read(b []byte) (int, error) {
+func (s *spoolingSource) Read(b []byte) (int, error) {
 	n, err := s.p.Conn.Read(b)
 	if n > 0 && s.p.record {
 		_, _ = s.p.spool.Write(b[:n])
@@ -344,16 +465,21 @@ func isWebSocketUpgrade(pc *probeConn) bool {
 	}()
 	first := true
 	total := 0
-	for i := 0; i < 64; i++ {
-		line, err := pc.r.ReadString('\n')
+	for i := 0; i < maxHeaderLines; i++ {
+		// ReadSlice (unlike ReadString) never grows the buffer, so a peer
+		// cannot force an unbounded allocation with one endless line.
+		line, err := pc.r.ReadSlice('\n')
+		if errors.Is(err, bufio.ErrBufferFull) {
+			return false // a header line over 16 KiB: not a normal request
+		}
 		if err != nil {
 			return false
 		}
 		total += len(line)
-		if total > 64*1024 {
+		if total > maxHeaderBytes {
 			return false
 		}
-		trimmed := strings.TrimRight(line, "\r\n")
+		trimmed := strings.TrimRight(string(line), "\r\n")
 		if first {
 			// A WebSocket upgrade is always a GET request.
 			if !strings.HasPrefix(trimmed, "GET ") {
@@ -375,6 +501,6 @@ func isWebSocketUpgrade(pc *probeConn) bool {
 
 func write503(conn net.Conn, msg string) {
 	body := fmt.Sprintf("<html><body><h1>503 Service Unavailable</h1><p>%s</p></body></html>", msg)
-	fmt.Fprintf(conn, "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+	fmt.Fprintf(conn, "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html; charset=utf-8\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
 	_ = conn.Close()
 }

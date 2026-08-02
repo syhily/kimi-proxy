@@ -16,7 +16,7 @@ func TestHandleHTTPNoClient(t *testing.T) {
 	clientSide, serverSide := net.Pipe()
 	defer clientSide.Close()
 
-	go handleHTTP(serverSide, time.Minute)
+	go handleHTTP(serverSide, time.Minute, 0)
 
 	if err := clientSide.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		t.Fatal(err)
@@ -64,6 +64,11 @@ func TestIsWebSocketUpgrade(t *testing.T) {
 		{
 			name: "empty request",
 			req:  "",
+			want: false,
+		},
+		{
+			name: "oversized header line",
+			req:  "GET / HTTP/1.1\r\nX-Big: " + strings.Repeat("a", 20*1024) + "\r\n\r\n",
 			want: false,
 		},
 	}

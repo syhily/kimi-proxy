@@ -44,6 +44,7 @@ type fileConfig struct {
 	KimiPort    int    `json:"kimi_port"`
 	KimiToken   string `json:"kimi_token"`
 	PublicHost  string `json:"public_host"`
+	HTTPS       bool   `json:"https"`
 	Attach      string `json:"attach"`
 	TunnelProto string `json:"tunnel_proto"`
 }
@@ -57,11 +58,12 @@ func main() {
 	kimiToken := flag.String("kimi-token", "", "fixed bearer token for kimi web (passed as KIMI_CODE_PASSWORD); empty keeps the persistent random token")
 	publicHost := flag.String("public-host", "", "public domain used to reach the server; passed to kimi web --allowed-host and used in the access URL hint")
 	attach := flag.String("attach", "", "attach to an already-running kimi web (host:port) instead of spawning one")
+	https := flag.Bool("https", false, "the public server is served over HTTPS (used in the access URL hint)")
 	tunnelProto := flag.String("tunnel-proto", "kcp", "tunnel transport: kcp (UDP) or tcp (TLS)")
 	flag.Parse()
 
 	if *configPath != "" {
-		applyConfigFile(*configPath, server, token, kimiBin, kimiPort, kimiToken, publicHost, attach, tunnelProto)
+		applyConfigFile(*configPath, server, token, kimiBin, kimiPort, kimiToken, publicHost, https, attach, tunnelProto)
 	}
 
 	if *server == "" {
@@ -109,18 +111,23 @@ func main() {
 		log.Fatalf("kimi web not ready: %v", err)
 	}
 	log.Printf("kimi web is ready at %s", local)
-	printAccessHint(*server, *publicHost, *kimiToken)
+	printAccessHint(*server, *publicHost, *kimiToken, *https)
 
 	backoff := time.Second
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		err := runTunnel(ctx, *server, *tunnelProto, *token, local)
+		alive, err := runTunnel(ctx, *server, *tunnelProto, *token, local)
 		if ctx.Err() != nil {
 			return
 		}
-		log.Printf("tunnel down: %v; reconnecting in %v", err, backoff)
+		log.Printf("tunnel down after %v: %v; reconnecting in %v", alive, err, backoff)
+		// A session that held for a while means the network recovered:
+		// restart the backoff so the next failure reconnects quickly.
+		if alive >= 2*time.Minute {
+			backoff = time.Second
+		}
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
@@ -132,7 +139,7 @@ func main() {
 
 // applyConfigFile loads the JSON config file and fills in any flag that was
 // not explicitly set on the command line.
-func applyConfigFile(path string, server, token, kimiBin *string, kimiPort *int, kimiToken *string, publicHost, attach, tunnelProto *string) {
+func applyConfigFile(path string, server, token, kimiBin *string, kimiPort *int, kimiToken *string, publicHost *string, https *bool, attach, tunnelProto *string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		log.Fatalf("read config %s: %v", path, err)
@@ -162,6 +169,9 @@ func applyConfigFile(path string, server, token, kimiBin *string, kimiPort *int,
 	if !set["public-host"] && cfg.PublicHost != "" {
 		*publicHost = cfg.PublicHost
 	}
+	if !set["https"] && cfg.HTTPS {
+		*https = true
+	}
 	if !set["attach"] && cfg.Attach != "" {
 		*attach = cfg.Attach
 	}
@@ -171,8 +181,11 @@ func applyConfigFile(path string, server, token, kimiBin *string, kimiPort *int,
 }
 
 // runTunnel establishes one authenticated tunnel session and serves streams
-// until the connection breaks.
-func runTunnel(ctx context.Context, server, protoName, token, local string) error {
+// until the connection breaks. It returns how long the session held before
+// breaking, so the caller can tell a stable session from a flapping one.
+func runTunnel(ctx context.Context, server, protoName, token, local string) (time.Duration, error) {
+	start := time.Now()
+	fail := func(err error) (time.Duration, error) { return time.Since(start), err }
 	var conn net.Conn
 	var err error
 	switch protoName {
@@ -181,34 +194,34 @@ func runTunnel(ctx context.Context, server, protoName, token, local string) erro
 	case "tcp":
 		conn, err = tunnel.DialTCP(server, token)
 	default:
-		return fmt.Errorf("unknown tunnel transport %q: want kcp or tcp", protoName)
+		return fail(fmt.Errorf("unknown tunnel transport %q: want kcp or tcp", protoName))
 	}
 	if err != nil {
-		return fmt.Errorf("dial %s: %w", server, err)
+		return fail(fmt.Errorf("dial %s: %w", server, err))
 	}
 	sess, err := smux.Client(conn, tunnel.SmuxConfig())
 	if err != nil {
 		_ = conn.Close()
-		return fmt.Errorf("smux client: %w", err)
+		return fail(fmt.Errorf("smux client: %w", err))
 	}
 	defer sess.Close()
 
 	// Control stream: authenticate, then heartbeat.
 	ctrl, err := sess.OpenStream()
 	if err != nil {
-		return fmt.Errorf("open control stream: %w", err)
+		return fail(fmt.Errorf("open control stream: %w", err))
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(authTimeout))
 	if err := proto.Write(ctrl, &proto.Message{Type: proto.TypeAuth, Version: proto.Version, Token: token}); err != nil {
-		return fmt.Errorf("send auth: %w", err)
+		return fail(fmt.Errorf("send auth: %w", err))
 	}
 	var reply proto.Message
 	if err := proto.Read(ctrl, &reply); err != nil {
-		return fmt.Errorf("read auth reply: %w", err)
+		return fail(fmt.Errorf("read auth reply: %w", err))
 	}
 	_ = conn.SetReadDeadline(time.Time{})
 	if reply.Type != proto.TypeAuthOK {
-		return fmt.Errorf("auth rejected: %s", reply.Text)
+		return fail(fmt.Errorf("auth rejected: %s", reply.Text))
 	}
 	log.Printf("tunnel established to %s", server)
 
@@ -240,12 +253,15 @@ func runTunnel(ctx context.Context, server, protoName, token, local string) erro
 				_ = sess.Close()
 				return
 			case <-ticker.C:
-				if err := proto.Write(ctrl, &proto.Message{Type: proto.TypePing}); err != nil {
+				// Check liveness before writing: if the control path is
+				// wedged, the write itself may block and the check would
+				// never run.
+				if time.Since(time.Unix(0, lastPong.Load())) > heartbeatTimeout {
+					log.Printf("server heartbeat lost, reconnecting")
 					_ = sess.Close()
 					return
 				}
-				if time.Since(time.Unix(0, lastPong.Load())) > heartbeatTimeout {
-					log.Printf("server heartbeat lost, reconnecting")
+				if err := proto.Write(ctrl, &proto.Message{Type: proto.TypePing}); err != nil {
 					_ = sess.Close()
 					return
 				}
@@ -256,7 +272,7 @@ func runTunnel(ctx context.Context, server, protoName, token, local string) erro
 	for {
 		stream, err := sess.AcceptStream()
 		if err != nil {
-			return fmt.Errorf("accept stream: %w", err)
+			return fail(fmt.Errorf("accept stream: %w", err))
 		}
 		go func() {
 			upstream, err := net.DialTimeout("tcp", local, 10*time.Second)
@@ -265,11 +281,12 @@ func runTunnel(ctx context.Context, server, protoName, token, local string) erro
 				_ = stream.Close()
 				return
 			}
-			// No idle timeout on the client: the hop to the local kimi web is
-			// trusted, and the server already guards the public side. An idle
-			// timeout here would kill WebSocket connections while the user
-			// thinks or reads, exactly when they must stay open.
-			tunnel.Pipe(upstream, stream, 0)
+			// No idle or lifetime bound on the client: the hop to the local
+			// kimi web is trusted, and the server already guards the public
+			// side. An idle timeout here would kill WebSocket connections
+			// while the user thinks or reads, exactly when they must stay
+			// open.
+			tunnel.Pipe(upstream, stream, 0, 0)
 		}()
 	}
 }
@@ -277,21 +294,29 @@ func runTunnel(ctx context.Context, server, protoName, token, local string) erro
 // printAccessHint prints the URL to open in the browser. A fixed kimiToken
 // (KIMI_CODE_PASSWORD) takes precedence; otherwise it falls back to the
 // persistent bearer token read from the kimi home directory.
-func printAccessHint(server, publicHost, kimiToken string) {
+func printAccessHint(server, publicHost, kimiToken string, https bool) {
 	host := publicHost
 	if host == "" {
-		host = strings.Split(server, ":")[0]
+		if h, _, err := net.SplitHostPort(server); err == nil {
+			host = h
+		} else {
+			host = server
+		}
+	}
+	scheme := "http"
+	if https {
+		scheme = "https"
 	}
 	if kimiToken != "" {
-		log.Printf("access the web UI at http://%s/#token=%s", host, kimiToken)
+		log.Printf("access the web UI at %s://%s/#token=%s", scheme, host, kimiToken)
 		return
 	}
 	token, err := os.ReadFile(serverTokenPath())
 	if err != nil {
-		log.Printf("access the web UI at http://%s (log in with your kimi web bearer token)", host)
+		log.Printf("access the web UI at %s://%s (log in with your kimi web bearer token)", scheme, host)
 		return
 	}
-	log.Printf("access the web UI at http://%s/#token=%s", host, strings.TrimSpace(string(token)))
+	log.Printf("access the web UI at %s://%s/#token=%s", scheme, host, strings.TrimSpace(string(token)))
 }
 
 func serverTokenPath() string {

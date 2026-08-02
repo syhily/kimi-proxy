@@ -35,7 +35,7 @@ func TestPipeBidirectionalAndClosePropagation(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		Pipe(a1, b1, time.Minute)
+		Pipe(a1, b1, time.Minute, 0)
 	}()
 
 	want := []byte("client-to-server payload")
@@ -73,7 +73,7 @@ func TestPipeIdleTimeoutTearsDown(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		Pipe(a1, b1, 100*time.Millisecond)
+		Pipe(a1, b1, 100*time.Millisecond, 0)
 	}()
 
 	if _, err := b2.Write([]byte("x")); err != nil {
@@ -97,7 +97,7 @@ func TestPipeIdleDisabled(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		Pipe(a1, b1, 0)
+		Pipe(a1, b1, 0, 0)
 	}()
 
 	if _, err := b2.Write([]byte("x")); err != nil {
@@ -107,5 +107,34 @@ func TestPipeIdleDisabled(t *testing.T) {
 	case <-done:
 		t.Fatal("Pipe must stay open with idle disabled")
 	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestPipeLifetimeTearsDownEvenWhenActive verifies the total-lifetime bound:
+// a connection that keeps producing traffic is still closed once lifetime
+// expires, so a trickle of bytes cannot hold it forever.
+func TestPipeLifetimeTearsDownEvenWhenActive(t *testing.T) {
+	a1, a2 := net.Pipe()
+	b1, b2 := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		Pipe(a1, b1, 0, 300*time.Millisecond)
+	}()
+
+	// Keep one direction busy with traffic well past the idle window; only
+	// the lifetime bound can end this connection.
+	stop := time.Now().Add(600 * time.Millisecond)
+	go func() {
+		buf := make([]byte, 4)
+		for time.Now().Before(stop) {
+			_, _ = a2.Write([]byte("tick"))
+			_, _ = b2.Read(buf)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Pipe did not enforce the lifetime bound")
 	}
 }

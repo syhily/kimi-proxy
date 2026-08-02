@@ -144,22 +144,34 @@ func SmuxConfig() *smux.Config {
 // as either direction finishes. idle bounds how long either side may stay
 // silent: a direction that produces no traffic for idle is treated as stuck
 // and tears the whole connection down, which keeps slow connections from
-// holding streams and goroutines open forever. Every read or write refreshes
-// the deadline, so busy streams are never affected. An idle <= 0 disables the
-// timeout.
-func Pipe(a, b net.Conn, idle time.Duration) {
+// holding streams and goroutines open forever. lifetime bounds the total age
+// of the connection regardless of traffic, so a peer that keeps the
+// connection alive with a trickle of bytes cannot hold it indefinitely
+// (idle <= 0 or lifetime <= 0 disables the respective bound). Every read or
+// write refreshes the idle deadline, so busy streams are never affected.
+func Pipe(a, b net.Conn, idle, lifetime time.Duration) {
+	absolute := time.Time{}
+	if lifetime > 0 {
+		absolute = time.Now().Add(lifetime)
+	}
 	done := make(chan struct{}, 2)
 	cp := func(dst, src net.Conn) {
 		defer func() { done <- struct{}{} }()
 		buf := make([]byte, 32*1024)
 		for {
+			d := absolute
 			if idle > 0 {
-				_ = src.SetReadDeadline(time.Now().Add(idle))
+				if t := time.Now().Add(idle); d.IsZero() || t.Before(d) {
+					d = t
+				}
+			}
+			if !d.IsZero() {
+				_ = src.SetReadDeadline(d)
 			}
 			n, err := src.Read(buf)
 			if n > 0 {
-				if idle > 0 {
-					_ = dst.SetWriteDeadline(time.Now().Add(idle))
+				if !d.IsZero() {
+					_ = dst.SetWriteDeadline(d)
 				}
 				if _, werr := dst.Write(buf[:n]); werr != nil {
 					break

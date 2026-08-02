@@ -55,6 +55,10 @@ docker run -d --name kimi-proxy \
 | `-tunnel-proto` | 隧道传输：`kcp`（UDP，默认）或 `tcp`（TLS 1.3，用于只能映射 TCP 端口的服务器） |
 | `-http-max-conns` | 公网 HTTP 最大并发连接数，默认 `256`，超限直接返回 503（防连接洪泛） |
 | `-http-idle-timeout` | 转发连接空闲超时，默认 `10m`（`0` 关闭）。WebSocket 升级连接自动豁免（对话思考、挂机时不断连），只清理"连接了却不发数据的慢速占用" |
+| `-http-max-duration` | 转发连接总寿命上限，默认 `24h`（`0` 关闭）。即使连接持续有流量也会到期断开，防止涓流式慢速连接无限占用资源 |
+| `-tunnel-conns-per-ip` | 隧道端口每 IP 每秒新建连接数上限，默认 `5`（突发 2 倍，`0` 关闭）。超限连接在 TLS/smux 之前被直接拒绝 |
+| `-http-conns-per-ip` | HTTP 入口每 IP 每秒新建连接数上限，默认 `50`（突发 2 倍，`0` 关闭）。前置 Caddy/Nginx 反代时流量都来自本机，此限制宽松且通常不生效 |
+| `-auth-fail-ban` | 认证失败 IP 临时封禁时长，默认 `10m`（`0` 关闭）。**仅 TCP 模式生效**（UDP 源地址可伪造，封禁会误伤）：TLS 证书固定失败（身份不匹配/收到 bad_certificate alert）即封禁，到期自动解封 |
 | `-tunnel-max-conns` | 隧道最大并发连接数（含未认证），默认 `8`。真实 client 只有 1 个，留足冗余防止被占满后无法重连 |
 | `-tls-cert` / `-tls-key` | 可选，成对提供后 HTTP 入口直接启用 HTTPS（TLS 1.2+），无需前置 Caddy/Nginx |
 
@@ -126,6 +130,7 @@ brew services start kimi-proxy
   "server": "kimi.example.com:7000",
   "token": "与 Server 相同的字符串",
   "public_host": "kimi.example.com",
+  "https": false,
   "kimi_bin": "kimi",
   "kimi_port": 0,
   "kimi_token": "固定 bearer token（可选，留空则 kimi web 用持久化随机 token）",
@@ -134,7 +139,7 @@ brew services start kimi-proxy
 }
 ```
 
-字段与下方 flag 一一对应（`kimi_bin` → `-kimi-bin`，`kimi_port` → `-kimi-port`，`kimi_token` → `-kimi-token`，`public_host` → `-public-host`，`tunnel_proto` → `-tunnel-proto`，`attach` → `-attach`）。
+字段与下方 flag 一一对应（`kimi_bin` → `-kimi-bin`，`kimi_port` → `-kimi-port`，`kimi_token` → `-kimi-token`，`public_host` → `-public-host`，`https` → `-https`，`tunnel_proto` → `-tunnel-proto`，`attach` → `-attach`）。
 
 ### Client 参数
 
@@ -149,15 +154,17 @@ brew services start kimi-proxy
 | `-kimi-token` | 固定 kimi web 的 bearer token（以 `KIMI_CODE_PASSWORD` 传给子进程），默认空（kimi web 用持久化随机 token） |
 | `-attach` | 不启动子进程，直接代理到已在运行的 kimi web（如 `127.0.0.1:58627`） |
 | `-tunnel-proto` | 隧道传输：`kcp`（UDP，默认）或 `tcp`（TLS，用于只能映射 TCP 的服务器），需与 Server 一致 |
+| `-https` | 公网入口启用了 HTTPS 时设置（Server 直连 `-tls-cert/-tls-key` 或前置 Caddy/Nginx），访问 URL 提示会使用 `https://` |
 
 ## 安全说明
 
 - 隧道 token 请使用强随机值（如 `openssl rand -base64 32`）。它经 HKDF-SHA256 按用途独立派生为 KCP 加密密钥和 TLS 证书身份，两种用途的密钥互不通用。
 - **v2 起 client 与 server 必须同步升级**：密钥派生方式已改变，且 TCP 模式改为双向证书固定，旧版与本版互相无法通信。
-- TCP 隧道模式下，双方都固定校验对端证书公钥：不知道 token 的连接在 TLS 握手阶段就会被拒绝。
+- TCP 隧道模式下，双方都固定校验对端证书公钥：不知道 token 的连接在 TLS 握手阶段就会被拒绝，其来源 IP 会被临时封禁（`-auth-fail-ban`，默认 10 分钟），无法反复尝试握手消耗服务器资源。
+- 隧道与 HTTP 入口均有 per-IP 连接速率限制（`-tunnel-conns-per-ip` / `-http-conns-per-ip`），超限连接在任何加密/协议处理前被直接关闭；另有全局并发上限与连接寿命上限兜底。
 - 不要把 Server 的 `-http-addr` 直接裸暴露在公网 HTTP 上，前面务必加 TLS（前置 Caddy/Nginx，或直接使用 `-tls-cert/-tls-key`）。
 - `kimi web` 的 bearer token 是公网访问的最终鉴权屏障，用 `-kimi-token` 固定时同样要使用强随机值。
-- KCP 模式使用 UDP，无法在应用层拦截伪造源地址的洪水包（kcp-go 内部会为任意来源的包建立会话）。如服务器暴露公网 UDP 端口，建议用防火墙对 `-tunnel-addr` 端口限速，例如：
+- KCP 模式使用 UDP。错误密钥的洪水包会在解密层被直接丢弃（不会建立会话，kcp-go 还会限制 accept 队列），但仍会消耗解密 CPU；如担心被针对，可用防火墙对 `-tunnel-addr` 端口限速，例如：
 
   ```sh
   # 仅示例：对 7000/udp 限速（iptables）

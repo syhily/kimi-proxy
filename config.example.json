@@ -2,6 +2,7 @@
   "server": "kimi.example.com:7000",
   "token": "换成强随机字符串（与 Server 相同）",
   "public_host": "kimi.example.com",
+  "https": true,
   "kimi_bin": "kimi",
   "kimi_port": 0,
   "kimi_token": "",
