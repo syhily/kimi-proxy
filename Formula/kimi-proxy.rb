@@ -1,8 +1,8 @@
 class KimiProxy < Formula
   desc "Encrypted KCP tunnel exposing kimi web through a public server"
   homepage "https://github.com/syhily/kimi-proxy"
-  url "https://github.com/syhily/kimi-proxy/archive/refs/tags/v0.1.4.tar.gz"
-  sha256 "39b2319e1437b76584248ba514a721293836854962148d6e1fba22546bd8589c"
+  url "https://github.com/syhily/kimi-proxy/archive/refs/tags/v0.1.5.tar.gz"
+  sha256 "79848b6bc42c172d25e963aa58072c6d94cd2bc8138b1afc2a482365a107230f"
   head "https://github.com/syhily/kimi-proxy.git", branch: "main"
 
   depends_on "go" => :build
